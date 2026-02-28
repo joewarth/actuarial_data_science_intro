@@ -16,9 +16,11 @@ import seaborn as sns
 import statsmodels.api as sm
 import itertools
 import patsy
+import xgboost as xgb
+import optuna
 
 from pandas.api.types import is_numeric_dtype, CategoricalDtype
-from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold
+from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold, KFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import TweedieRegressor
 from sklearn.metrics import mean_tweedie_deviance
@@ -26,6 +28,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from joblib import Parallel, delayed
 from scipy.optimize import minimize_scalar
 from patsy import dmatrix, build_design_matrices
+from xgboost import XGBRegressor
 
 def fmt_cap(cap):
     if cap is None: return "uncapped"
@@ -772,7 +775,218 @@ class PatsySplineTransformer(BaseEstimator, TransformerMixin):
 
     def get_feature_names_out(self, input_features=None):
         return np.array(self.feature_names_, dtype=object)
-    
+
+def make_X_y(df, cat_cols, num_cols, y_col, exposure_col="Exposure"):
+    X = df[cat_cols + num_cols].copy()
+
+    # Categoricals: category dtype + explicit missing bucket
+    for c in cat_cols:
+        X[c] = X[c].astype("category")
+        if X[c].isna().any():
+            X[c] = X[c].cat.add_categories(["__MISSING__"]).fillna("__MISSING__")
+
+    # Numerics: coerce -> float, then clean only numeric cols
+    for c in num_cols:
+        X[c] = pd.to_numeric(X[c], errors="coerce")
+
+    X[num_cols] = X[num_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # y and weights
+    y = pd.to_numeric(df[y_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    w = pd.to_numeric(df[exposure_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+
+    # Exposure-weighted base_score in log-space (your original intent)
+    base_score_untrans = (w * y).sum() / max(w.sum(), 1e-12)
+    base_score = float(np.log(base_score_untrans + 1e-12))
+
+    return X, y, w, base_score
+
+def tune_xgb_tweedie_optuna(
+    df,
+    cat_cols,
+    num_cols,
+    y_col,
+    exposure_col="Exposure",
+    n_splits=5,
+    n_trials=50,
+    random_state=42,
+    num_boost_round_max=5000,
+    early_stopping_rounds=50,
+):
+    # ----------------------------
+    # Preprocess (native categorical)
+    # ----------------------------
+    X = df[cat_cols + num_cols].copy()
+
+    # Categoricals: category dtype; explicit missing category (never fill cat cols with 0.0)
+    for c in cat_cols:
+        X[c] = X[c].astype("category")
+        if X[c].isna().any():
+            X[c] = X[c].cat.add_categories(["__MISSING__"]).fillna("__MISSING__")
+
+    # Numerics: coerce + clean numeric-only
+    for c in num_cols:
+        X[c] = pd.to_numeric(X[c], errors="coerce")
+    X[num_cols] = X[num_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    y = pd.to_numeric(df[y_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    w = pd.to_numeric(df[exposure_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+
+    # Exposure-weighted base_score in log space (your logic)
+    base_score_untrans = (w * y).sum() / max(w.sum(), 1e-12)
+    base_score = float(np.log(base_score_untrans + 1e-12))
+
+    # Save categories for predict-time alignment
+    train_categories = {c: X[c].cat.categories for c in cat_cols}
+
+    dtrain = xgb.DMatrix(X, label=y, weight=w, enable_categorical=True)
+
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    folds = [(tr_idx, va_idx) for tr_idx, va_idx in kf.split(X)]
+
+    def _get_test_metric_col(cv_df: pd.DataFrame) -> str:
+        # Find the "test-...-mean" column (there will be exactly one for our eval_metric)
+        # Example: 'test-tweedie-nloglik@1.38-mean'
+        candidates = [c for c in cv_df.columns if c.startswith("test-") and c.endswith("-mean")]
+        if len(candidates) != 1:
+            raise RuntimeError(f"Expected exactly 1 test metric mean column, found: {candidates}")
+        return candidates[0]
+
+    def objective(trial: optuna.Trial) -> float:
+        p = trial.suggest_float("tweedie_variance_power", 1.2, 1.9, step=0.05)
+
+        # XGBoost 3.x REQUIREMENT:
+        # tweedie-nloglik metric must be formatted as tweedie-nloglik@rho
+        eval_metric = f"tweedie-nloglik@{p:.2f}"
+
+        params = {
+            "objective": "reg:tweedie",
+            "tweedie_variance_power": p,
+            "eval_metric": eval_metric,
+            "base_score": base_score,
+            "tree_method": "hist",
+            "seed": random_state,
+
+            # learning rate (fine grid but bounded)
+            "eta": trial.suggest_float("eta", 0.01, 0.15, step=0.01),
+
+            "max_depth": trial.suggest_int("max_depth", 2, 10),
+
+            # min_child_weight — DO NOT use log if you use step
+            # pick a reasonable bounded grid instead
+            "min_child_weight": trial.suggest_float("min_child_weight", 1, 100000, step=5000),
+
+            "gamma": trial.suggest_float("gamma", 0.0, 10.0, step=0.5),
+
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0, step=0.05),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0, step=0.05),
+
+            "lambda": trial.suggest_float("lambda", 0.0, 50.0, step=1.0),
+            "alpha": trial.suggest_float("alpha", 0.0, 10.0, step=0.5),
+
+            "max_delta_step": trial.suggest_float("max_delta_step", 0.0, 5.0, step=0.5),
+
+            "max_cat_to_onehot": trial.suggest_int("max_cat_to_onehot", 1, 16),
+            "max_cat_threshold": trial.suggest_int("max_cat_threshold", 8, 256),
+        }
+
+        cv = xgb.cv(
+            params=params,
+            dtrain=dtrain,
+            num_boost_round=num_boost_round_max,
+            folds=folds,
+            early_stopping_rounds=early_stopping_rounds,
+            verbose_eval=False,
+        )
+
+        test_col = _get_test_metric_col(cv)
+        return float(cv[test_col].min())
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=n_trials)
+
+    # Recover best params + best boosting rounds
+    best_trial = study.best_trial
+    p_best = best_trial.params["tweedie_variance_power"]
+    eval_metric_best = f"tweedie-nloglik@{p_best}"
+
+    best_params = {
+        "objective": "reg:tweedie",
+        "tweedie_variance_power": p_best,
+        "eval_metric": eval_metric_best,
+
+        "base_score": base_score,
+        "tree_method": "hist",
+        "seed": random_state,
+
+        "eta": best_trial.params["eta"],
+        "max_depth": best_trial.params["max_depth"],
+        "min_child_weight": best_trial.params["min_child_weight"],
+        "gamma": best_trial.params["gamma"],
+
+        "subsample": best_trial.params["subsample"],
+        "colsample_bytree": best_trial.params["colsample_bytree"],
+
+        "lambda": best_trial.params["lambda"],
+        "alpha": best_trial.params["alpha"],
+
+        "max_delta_step": best_trial.params["max_delta_step"],
+        "max_cat_to_onehot": best_trial.params["max_cat_to_onehot"],
+        "max_cat_threshold": best_trial.params["max_cat_threshold"],
+    }
+
+    cv_best = xgb.cv(
+        params=best_params,
+        dtrain=dtrain,
+        num_boost_round=num_boost_round_max,
+        folds=folds,
+        early_stopping_rounds=early_stopping_rounds,
+        verbose_eval=False,
+    )
+    best_num_boost_round = int(cv_best.shape[0])
+
+    return study, best_params, best_num_boost_round, train_categories
+
+
+def preprocess_for_predict(df_new, cat_cols, num_cols, train_categories=None):
+    """
+    Preprocess df_new into X_new for XGBoost native categorical handling.
+
+    - Categorical cols -> pandas 'category'
+    - Missing cats -> '__MISSING__' (same as training)
+    - Optionally align category levels to those seen in training (train_categories)
+      Unseen categories become NaN -> '__MISSING__'
+    - Numeric cols -> float, inf -> NaN, fill numeric NaNs with 0.0
+    """
+    X_new = df_new[cat_cols + num_cols].copy()
+
+    # --- categoricals ---
+    for c in cat_cols:
+        X_new[c] = X_new[c].astype("category")
+
+        # Ensure '__MISSING__' exists so fillna won't error
+        if train_categories is not None:
+            # Align to training categories (+ ensure '__MISSING__' exists if it did in training)
+            X_new[c] = X_new[c].cat.set_categories(train_categories[c])
+            if "__MISSING__" in train_categories[c]:
+                X_new[c] = X_new[c].fillna("__MISSING__")
+            # If training didn't use '__MISSING__', leave NaN as missing (OK for XGBoost)
+        else:
+            # No training category map provided; still use explicit missing bucket
+            if X_new[c].isna().any():
+                X_new[c] = X_new[c].cat.add_categories(["__MISSING__"]).fillna("__MISSING__")
+            else:
+                # even if no NaNs now, adding is harmless but optional
+                pass
+
+    # --- numerics ---
+    for c in num_cols:
+        X_new[c] = pd.to_numeric(X_new[c], errors="coerce")
+
+    X_new[num_cols] = X_new[num_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    return X_new
+
 def assign_weighted_deciles(score: pd.Series, weight: pd.Series, n=10) -> pd.Series:
     """Return decile labels 1..n so each bucket has ~equal total weight."""
     s = pd.DataFrame({"score": score, "w": weight}).sort_values("score").reset_index()
