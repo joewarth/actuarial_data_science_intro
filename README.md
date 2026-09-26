@@ -1,39 +1,55 @@
-# Project Overview
+# Actuarial Data Science Presentation
 
-This repository contains an end-to-end modeling workflow organized into two Jupyter notebooks. 
+## Overview
 
-This is an overly simplistic demonstration that I use for brief presentations to audiences familiar with OLS regression, but that need to be introduced to other modeling techniques. The goal of this project is to provide a brief and transparent modeling workflow that clearly documents both *why* modeling decisions were made (EDA) and *how* final models were constructed and evaluated.
+This project is an educational demonstration of insurance pure-premium modeling using the public French Motor Third-Party Liability Claims dataset. The workflow prepares policy-level data, explores pure-premium patterns, and compares three models:
 
-## Environment Setup
+- Ordinary least squares regression
+- A Tweedie generalized linear model
+- An XGBoost Tweedie gradient-boosting model
 
-This project does not commit the virtual environment (`.venv/`) to version control. Recreate the Python environment from `requirements.txt` using python -m pip install -r requirements.txt
+The primary workflow is in [modeling.ipynb](modeling.ipynb). Supporting data preparation, plotting, model-fitting, and evaluation functions are in [modeling_utils.py](modeling_utils.py).
 
-## Notebooks
+## Setup
 
-### 01_data_eda.ipynb — Data Exploration & Preparation
+Create and activate a virtual environment from the project directory:
 
-This notebook focuses on understanding and preparing the data prior to modeling. Typical steps include:
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
 
-- Data loading and initial validation
-- Exploratory data analysis (distributions, relationships, data quality checks)
-- Feature inspection and preliminary transformations
-- Identification of modeling considerations (e.g., sparsity, nonlinearity, outliers)
+On macOS or Linux, activate it with:
 
-Outputs from this notebook are intended to inform modeling decisions rather than finalize them.
+```bash
+source .venv/bin/activate
+```
 
-### 02_modeling.ipynb — Modeling & Evaluation
+Install the required packages:
 
-This notebook builds on insights from the EDA phase to develop predictive models. It typically includes:
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
 
-- Model specification and training
-- Hyperparameter selection
-- Model evaluation and diagnostics
-- Comparison of alternative modeling approaches
+Open [modeling.ipynb](modeling.ipynb) in VS Code or Jupyter and run the cells in order. The workflow reads cached parquet files from [data](data) when available. If the raw parquet files are unavailable, it downloads the frequency and severity datasets from OpenML.
 
-Model results and key performance metrics are documented directly in the notebook.
+The XGBoost tuning configuration requests a CUDA device. A CUDA-capable XGBoost installation and compatible GPU are required for that configuration. For CPU-only environments, change the XGBoost `device` setting in [modeling_utils.py](modeling_utils.py) to `cpu`.
 
-## Usage Notes
+Export the notebook to HTML with:
 
-- Notebooks are designed to be run sequentially (`01_data_eda.ipynb` → `02_modeling.ipynb`).
-- Assumes required Python packages are installed in the active environment.
-- Paths, parameters, and settings may be adjusted for experimentation or extension.
+```powershell
+python -m jupyter nbconvert --to html modeling.ipynb
+```
+
+This creates `modeling.html` in the project directory.
+
+## Project Notes
+
+- The project is an educational example, not a production-ready insurance pricing system.
+- The modeling target is capped pure premium with individual claims capped at $1 million.
+- The train/test split is policy-level and approximately matched on portfolio claim frequency.
+- XGBoost tuning uses cross-validation; the held-out test data is reserved for final comparison.
+- The workflow does not provide production deployment, regulatory filing support, rate certification, calibration analysis, fairness assessment, or model monitoring.
+- Results depend on the package versions, random seeds, hardware, and available cached data.
+- The source dataset is publicly available through OpenML datasets 41214 and 41215.
